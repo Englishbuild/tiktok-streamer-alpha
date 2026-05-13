@@ -46,18 +46,22 @@ def vtt_to_srt(vtt_content):
     return "\n".join(srt_lines).strip()
 
 
-# --- API Endpoint for Caption ---
+# --- API Endpoint for Caption / Info ---
 @app.route('/info')
 def get_info_endpoint():
-    tiktok_url = request.args.get('url')
-    if not tiktok_url:
+    video_url = request.args.get('url')
+    if not video_url:
         return jsonify({"error": "Missing 'url' query parameter"}), 400
 
     try:
         with yt_dlp.YoutubeDL({'quiet': True, 'noplaylist': True}) as ydl:
-            info = ydl.extract_info(tiktok_url, download=False)
+            info = ydl.extract_info(video_url, download=False)
             caption = info.get('description') or info.get('title', 'No caption found')
-            return jsonify({"caption": caption})
+            return jsonify({
+                "platform": info.get('extractor_key', 'Unknown'),
+                "title": info.get('title'),
+                "caption": caption
+            })
     except Exception as e:
         return jsonify({"error": f"Could not retrieve info: {str(e)}"}), 500
 
@@ -65,8 +69,8 @@ def get_info_endpoint():
 # --- Streaming Endpoint ---
 @app.route('/stream')
 def stream_video_endpoint():
-    tiktok_url = request.args.get('url')
-    if not tiktok_url:
+    video_url = request.args.get('url')
+    if not video_url:
         return jsonify({"error": "Missing 'url' query parameter"}), 400
         
     try:
@@ -74,7 +78,7 @@ def stream_video_endpoint():
             sys.executable, '-m', 'yt_dlp',
             '--format', 'best[ext=mp4]/best',
             '--output', '-',
-            '--quiet', tiktok_url
+            '--quiet', video_url
         ]
 
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -95,21 +99,20 @@ def stream_video_endpoint():
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
 
-# --- API Endpoint for SRT Subtitles ---
+# --- API Endpoint for SRT Subtitles (Universal for YouTube & TikTok) ---
 @app.route('/srt')
 def get_srt_endpoint():
-    tiktok_url = request.args.get('url')
+    video_url = request.args.get('url')
     cookie_string = request.args.get('cookie')
-    lang_request = request.args.get('lang', 'eng-US')
+    lang_request = request.args.get('lang', 'en') # Defaulted to 'en' as it's standard for YT
 
-    if not tiktok_url:
+    if not video_url:
         return jsonify({"error": "Missing 'url' query parameter"}), 400
 
     try:
         ydl_opts = {
             'quiet': True,
             'noplaylist': True,
-            # CRITICAL FIX: Explicitly tell yt-dlp to extract auto-captions during the API call
             'writesubtitles': True,
             'writeautomaticsub': True,
             'subtitleslangs': ['all']
@@ -118,7 +121,7 @@ def get_srt_endpoint():
             ydl_opts['http_headers'] = {'Cookie': cookie_string}
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(tiktok_url, download=False)
+            info = ydl.extract_info(video_url, download=False)
             
             # Combine manually uploaded subtitles AND auto-generated captions
             subs_manual = info.get('subtitles') or {}
@@ -133,27 +136,34 @@ def get_srt_endpoint():
             sub_url = None
             sub_ext = None
             
-            # Helper to find the best format (Prefer VTT, fallback to JSON)
+            # Helper to find the best format (Prefer VTT/SRT for YouTube & TikTok)
             def get_best_format(formats):
+                # 1. Look for native SRT
+                for fmt in formats:
+                    if fmt.get('ext') == 'srt':
+                        return fmt.get('url'), 'srt'
+                # 2. Look for VTT (Which YouTube heavily uses and we can convert)
                 for fmt in formats:
                     if fmt.get('ext') == 'vtt':
                         return fmt.get('url'), 'vtt'
+                # 3. Fallback to json (TikTok) or json3 (YouTube)
                 for fmt in formats:
-                    if fmt.get('ext') == 'json':
-                        return fmt.get('url'), 'json'
+                    if 'json' in fmt.get('ext', ''):
+                        return fmt.get('url'), fmt.get('ext')
+                # 4. Ultimate fallback
                 if formats:
                     return formats[0].get('url'), formats[0].get('ext')
                 return None, None
 
-            # 1. Look for English (or requested) languages first
-            preferred_langs = [lang_request, 'eng-US', 'en-US', 'en', 'eng']
+            # Look for English (or requested) languages first in multiple common variations
+            preferred_langs = [lang_request, 'en', 'en-US', 'eng-US', 'eng', 'en-GB']
             for lang in preferred_langs:
                 if lang in subs:
                     sub_url, sub_ext = get_best_format(subs[lang])
                     if sub_url:
                         break
                         
-            # 2. If no english found, grab the first available language
+            # If no english found, grab the very first available language format
             if not sub_url:
                 for lang, formats in subs.items():
                     sub_url, sub_ext = get_best_format(formats)
@@ -162,24 +172,25 @@ def get_srt_endpoint():
 
             if not sub_url:
                 return jsonify({
-                    "error": "Subtitles exist, but no download URL is available.",
+                    "error": "Subtitles exist, but no standard text download URL is available.",
                     "available_langs": list(subs.keys())
                 }), 404
 
-            # Fetch the subtitle content from the direct URL
+            # Fetch the subtitle content from the direct URL (with timeout to prevent freezing)
             req = urllib.request.Request(sub_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=15) as response:
                 content = response.read().decode('utf-8')
                 
-            # If it's VTT, convert to standard SRT
+            # If it's VTT, run it through our converter to output standard SRT
             if sub_ext == 'vtt' or 'WEBVTT' in content:
                 srt_content = vtt_to_srt(content)
                 return Response(srt_content, mimetype='text/plain; charset=utf-8')
-            
-            # If TikTok forced a JSON subtitle, return raw JSON so the API doesn't crash
-            if sub_ext == 'json':
+                
+            # If YouTube/TikTok forced a JSON format, return raw JSON
+            if 'json' in sub_ext:
                 return Response(content, mimetype='application/json; charset=utf-8')
                 
+            # Return raw string if it's already srt
             return Response(content, mimetype='text/plain; charset=utf-8')
 
     except Exception as e:
@@ -189,7 +200,7 @@ def get_srt_endpoint():
 # --- Root Endpoint ---
 @app.route('/')
 def home():
-    return "TikTok Streaming & Subtitle API v10 is running."
+    return "Universal YouTube & TikTok Streaming & Subtitle API v11 is running."
 
 if __name__ == "__main__":
     app.run()
