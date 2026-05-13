@@ -1,8 +1,7 @@
 import subprocess
-import glob
 import os
-import tempfile
 import re
+import urllib.request
 from flask import Flask, Response, request, jsonify
 import yt_dlp
 import sys
@@ -10,28 +9,22 @@ import sys
 app = Flask(__name__)
 
 # --- Helper: Pure Python VTT to SRT Converter ---
-# Vercel doesn't have FFmpeg, so yt-dlp cannot convert .vtt to .srt automatically.
-# This lightweight function handles the conversion so your API still returns valid SRT.
 def vtt_to_srt(vtt_content):
     lines = vtt_content.splitlines()
     srt_lines =[]
     counter = 1
     
     for i, line in enumerate(lines):
-        # Skip VTT header metadata
         if i == 0 and "WEBVTT" in line:
             continue
         if line.startswith("Kind:") or line.startswith("Language:"):
             continue
             
-        # Format Timestamp line
         if "-->" in line:
             parts = line.split("-->")
             fixed_parts =[]
             for part in parts:
-                # SRT uses a comma for milliseconds, VTT uses a period
                 part = part.strip().replace('.', ',')
-                # Prepend '00:' if timestamp is missing hours (e.g. MM:SS,mmm -> 00:MM:SS,mmm)
                 if part.count(':') == 1:
                     part = "00:" + part
                 fixed_parts.append(part)
@@ -44,11 +37,8 @@ def vtt_to_srt(vtt_content):
             counter += 1
         else:
             if "WEBVTT" not in line:
-                # Skip identifier lines that appear right before the timestamp
                 if i + 1 < len(lines) and "-->" in lines[i + 1]:
                     continue
-                
-                # Remove VTT inline styling (like <c.color> or <b>)
                 clean_line = re.sub(r'<[^>]+>', '', line)
                 if clean_line.strip() or (srt_lines and srt_lines[-1] != ""):
                     srt_lines.append(clean_line)
@@ -99,7 +89,6 @@ def stream_video_endpoint():
             finally:
                 if process.poll() is None:
                     process.terminate()
-                print("Stream process finished.")
 
         return Response(generate_stream(), mimetype='video/mp4')
     except Exception as e:
@@ -111,60 +100,66 @@ def stream_video_endpoint():
 def get_srt_endpoint():
     tiktok_url = request.args.get('url')
     cookie_string = request.args.get('cookie')
-    # Default to TikTok's standard "eng-US" instead of "en"
-    lang = request.args.get('lang', 'eng-US')
+    lang_request = request.args.get('lang', 'eng-US')
 
     if not tiktok_url:
         return jsonify({"error": "Missing 'url' query parameter"}), 400
 
     try:
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
-            command =[
-                sys.executable, '-m', 'yt_dlp',
-                '--write-sub',        # CHANGED: Normal subs, not auto-subs
-                '--sub-lang', lang,
-                '--skip-download',
-                # REMOVED: '--sub-format', 'srt' because Vercel lacks FFmpeg to convert it
-                '--output', os.path.join(tmpdir, '%(id)s.%(ext)s'),
-                '--quiet',
-            ]
+        ydl_opts = {
+            'quiet': True,
+            'noplaylist': True,
+        }
+        if cookie_string:
+            ydl_opts['http_headers'] = {'Cookie': cookie_string}
 
-            if cookie_string:
-                print("Using provided cookie for authentication.")
-                command.extend(['--add-header', f'Cookie: {cookie_string}'])
-            else:
-                print("No cookie provided, making an anonymous request.")
+        # Use the Python API to extract meta-data (no subprocess needed!)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(tiktok_url, download=False)
+            
+            subs = info.get('subtitles', {})
+            if not subs:
+                return jsonify({"error": "No subtitles found for this video."}), 404
 
-            command.append(tiktok_url)
-
-            result = subprocess.run(command, capture_output=True, timeout=25)
-
-            # Look for the .vtt files (or any subtitle format it grabbed)
-            sub_files = glob.glob(os.path.join(tmpdir, f'*.{lang}.*'))
-            if not sub_files:
-                # Fallback: grab any file that isn't a video format
-                all_files = glob.glob(os.path.join(tmpdir, '*.*'))
-                sub_files = [f for f in all_files if not f.endswith(('.mp4', '.webm', '.mkv'))]
-
-            if sub_files:
-                with open(sub_files[0], 'r', encoding='utf-8') as f:
-                    content = f.read()
+            sub_url = None
+            
+            # 1. Look for English formats in order of priority (fixes missing lang bugs)
+            preferred_langs = [lang_request, 'eng-US', 'en-US', 'en', 'eng']
+            for lang in preferred_langs:
+                if lang in subs:
+                    for fmt in subs[lang]:
+                        if fmt.get('ext') == 'vtt':
+                            sub_url = fmt.get('url')
+                            break
+                if sub_url:
+                    break
                     
-                # If yt-dlp downloaded a VTT file, manually convert to SRT
-                if sub_files[0].endswith('.vtt'):
-                    content = vtt_to_srt(content)
+            # 2. If no english found, fallback to the first available language!
+            if not sub_url:
+                for lang, formats in subs.items():
+                    for fmt in formats:
+                        if fmt.get('ext') == 'vtt':
+                            sub_url = fmt.get('url')
+                            break
+                    if sub_url:
+                        break
 
-                return Response(content, mimetype='text/plain; charset=utf-8')
-            else:
-                error_message = result.stderr.decode('utf-8', 'ignore')
-                print(f"Subtitle generation failed for {tiktok_url}. Stderr: {error_message}")
+            # 3. If STILL no VTT url found, return exact details of what IS available
+            if not sub_url:
                 return jsonify({
-                    "error": f"Subtitles not found for language '{lang}'",
-                    "detail": error_message
+                    "error": "Subtitles exist, but no VTT format is available.",
+                    "available_langs": list(subs.keys())
                 }), 404
 
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Request timed out while fetching subtitles"}), 504
+            # Fetch the VTT file content directly into memory
+            req = urllib.request.Request(sub_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                vtt_content = response.read().decode('utf-8')
+                
+            # Convert to SRT and serve
+            srt_content = vtt_to_srt(vtt_content)
+            return Response(srt_content, mimetype='text/plain; charset=utf-8')
+
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
@@ -172,7 +167,7 @@ def get_srt_endpoint():
 # --- Root Endpoint ---
 @app.route('/')
 def home():
-    return "TikTok Streaming & Subtitle API v8 is running."
+    return "TikTok Streaming & Subtitle API v9 is running."
 
 if __name__ == "__main__":
     app.run()
