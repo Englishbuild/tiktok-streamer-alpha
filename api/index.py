@@ -1,11 +1,14 @@
 import subprocess
+import glob
+import os
+import tempfile
 from flask import Flask, Response, request, jsonify
 import yt_dlp
 import sys
 
 app = Flask(__name__)
 
-# --- API Endpoint for Caption (No changes) ---
+# --- API Endpoint for Caption ---
 @app.route('/info')
 def get_info_endpoint():
     tiktok_url = request.args.get('url')
@@ -20,13 +23,12 @@ def get_info_endpoint():
     except Exception as e:
         return jsonify({"error": f"Could not retrieve info: {str(e)}"}), 500
 
-# --- Streaming Endpoint (No changes) ---
+# --- Streaming Endpoint ---
 @app.route('/stream')
 def stream_video_endpoint():
     tiktok_url = request.args.get('url')
     if not tiktok_url:
         return jsonify({"error": "Missing 'url' query parameter"}), 400
-
     try:
         command = [
             sys.executable, '-m', 'yt_dlp',
@@ -51,60 +53,63 @@ def stream_video_endpoint():
                 print("Stream process finished.")
 
         return Response(generate_stream(), mimetype='video/mp4')
-
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
-# --- UPDATED API Endpoint for SRT Subtitles with Cookie Support ---
+# --- API Endpoint for SRT Subtitles ---
 @app.route('/srt')
 def get_srt_endpoint():
     tiktok_url = request.args.get('url')
-    cookie_string = request.args.get('cookie') # New: Get cookie from query params
+    cookie_string = request.args.get('cookie')
     lang = request.args.get('lang', 'en')
 
     if not tiktok_url:
         return jsonify({"error": "Missing 'url' query parameter"}), 400
 
     try:
-        # Base command for getting subtitles
-        command = [
-            sys.executable, '-m', 'yt_dlp',
-            '--write-auto-subs',
-            '--sub-lang', lang,
-            '--skip-download',
-            '--sub-format', 'srt',
-            '--output', '-',
-            '--quiet' # Add quiet to prevent yt-dlp's own messages from interfering
-        ]
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+            command = [
+                sys.executable, '-m', 'yt_dlp',
+                '--write-auto-subs',
+                '--sub-lang', lang,
+                '--skip-download',
+                '--sub-format', 'srt',
+                '--output', os.path.join(tmpdir, '%(id)s.%(ext)s'),
+                '--quiet',
+            ]
 
-        # --- THIS IS THE CRITICAL CHANGE ---
-        # If a cookie is provided, add it as a header to the command
-        if cookie_string:
-            print("Using provided cookie for authentication.")
-            command.extend(['--add-header', f"Cookie: {cookie_string}"])
-        else:
-            print("No cookie provided, making an anonymous request.")
-            
-        # The last argument must be the URL
-        command.append(tiktok_url)
+            if cookie_string:
+                print("Using provided cookie for authentication.")
+                command.extend(['--add-header', f'Cookie: {cookie_string}'])
+            else:
+                print("No cookie provided, making an anonymous request.")
 
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate()
-        
-        srt_content = stdout.decode('utf-8', 'ignore')
+            command.append(tiktok_url)
 
-        if srt_content.strip():
-            return Response(srt_content, mimetype='text/plain; charset=utf-8')
-        else:
-            # Provide more debug info if it fails
-            error_message = stderr.decode('utf-8', 'ignore')
-            print(f"SRT generation failed for {tiktok_url}. Stderr: {error_message}")
-            return jsonify({"error": f"Subtitles not found for language '{lang}'."}), 404
+            result = subprocess.run(command, capture_output=True, timeout=25)
 
+            # Try exact lang match first, then fallback to any .srt
+            srt_files = glob.glob(os.path.join(tmpdir, f'*.{lang}*.srt'))
+            if not srt_files:
+                srt_files = glob.glob(os.path.join(tmpdir, '*.srt'))
+
+            if srt_files:
+                with open(srt_files[0], 'r', encoding='utf-8') as f:
+                    return Response(f.read(), mimetype='text/plain; charset=utf-8')
+            else:
+                error_message = result.stderr.decode('utf-8', 'ignore')
+                print(f"SRT generation failed for {tiktok_url}. Stderr: {error_message}")
+                return jsonify({
+                    "error": f"Subtitles not found for language '{lang}'",
+                    "detail": error_message
+                }), 404
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Request timed out while fetching subtitles"}), 504
     except Exception as e:
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
-# --- Root Endpoint (Updated for clarity) ---
+# --- Root Endpoint ---
 @app.route('/')
 def home():
-    return "TikTok Streaming & Subtitle API v7 (Cookie Auth) is running."
+    return "TikTok Streaming & Subtitle API v8 is running."
